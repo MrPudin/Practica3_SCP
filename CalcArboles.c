@@ -1,114 +1,9 @@
 #include <stdlib.h>
-#include <stdio.h>
 #include <math.h>
-#include <pthread_time.h>
+#include <time.h>
 #include <string.h>
 
-#include "ConvexHull.h"
-
-#define DMaxArboles 	25
-#define DMaximoCoste 999999
-#define S 1000000
-#define DDebug 0
-
-
-  //////////////////////////
- // Estructuras de datos //
-//////////////////////////
-
-
-// Definicin estructura arbol entrada (Conjunto �boles).
-struct  Arbol
-{
-	int	  IdArbol;
-	Point Coord;			// Posicin �bol
-	int Valor;				// Valor / Coste �bol.
-	int Longitud;			// Cantidad madera �bol
-};
-typedef struct Arbol TArbol, *PtrArbol;
-
-
-
-// Definicin estructura Bosque entrada (Conjunto �boles).
-struct Bosque
-{
-	int 		NumArboles;
-	TArbol 	Arboles[DMaxArboles];
-};
-typedef struct Bosque TBosque, *PtrBosque;
-
-
-
-// Combinacin .
-struct ListaArboles
-{
-	int 		NumArboles;
- 	float		Coste;
-	float		CosteArbolesCortados;
-	float		CosteArbolesRestantes;
-	float		LongitudCerca;
-	float		MaderaSobrante;
-	int 		Arboles[DMaxArboles];
-};
-typedef struct ListaArboles TListaArboles, *PtrListaArboles;
-
-
-// Estadisticas
-typedef struct
-{
-	int CombinacionesEvaluadas;
-	int CombinacionesValidas;
-	int CombinacionesNoValidas;
-	int MejorCombinacionCoste;
-	int PeorCombinacionCoste;
-	int MejorCombinacionArboles;
-	int PeorCombinacionArboles;
-} TEstadisticas, *PtrEstadisticas;
-
-
-
-// Vector est�ico Coordenadas.
-typedef Point TVectorCoordenadas[DMaxArboles], *PtrVectorCoordenadas;
-
-
-typedef enum {false, true} bool;
-
-
-  ////////////////////////
- // Variables Globales //
-////////////////////////
-
-TBosque ArbolesEntrada;
-double elapsed_sec;
-
-// Estadisticas
-TEstadisticas TotalEstadisticas={0,0,0,DMaximoCoste,0,DMaxArboles,0};
-
-
-  //////////////////////////
- // Prototipos funciones //
-//////////////////////////
-
-bool LeerFicheroEntrada(char *PathFicIn);
-bool GenerarFicheroSalida(TListaArboles optimo, char *PathFicOut);
-void PrintResultado(TListaArboles Optimo);
-bool GenerarFicheroSalidaFile(TListaArboles Optimo, FILE *FicOut);
-bool CalcularCercaOptima(PtrListaArboles Optimo);
-void OrdenarArboles();
-bool CalcularCombinacionOptima(int PrimeraCombinacion, int UltimaCombinacion, PtrListaArboles Optimo);
-int EvaluarCombinacionListaArboles(int Combinacion);
-int ConvertirCombinacionToArboles(int Combinacion, PtrListaArboles CombinacionArboles);
-int ConvertirCombinacionToArbolesTalados(int Combinacion, PtrListaArboles CombinacionArbolesTalados);
-void ObtenerListaCoordenadasArboles(TListaArboles CombinacionArboles, TVectorCoordenadas Coordenadas);
-float CalcularLongitudCerca(TVectorCoordenadas CoordenadasCerca, int SizeCerca);
-float CalcularDistancia(int x1, int y1, int x2, int y2);
-int CalcularMaderaArbolesTalados(TListaArboles CombinacionArboles);
-int CalcularCosteCombinacion(TListaArboles CombinacionArboles);
-void MostrarArboles(TListaArboles CombinacionArboles);
-void ResetEstadidisticas(PtrEstadisticas std);
-void PrintEstadisticas(TEstadisticas estadisticas, char *tipo);
-
-
+#include "CalcArboles.h"
 
 
 int main(int argc, char *argv[])
@@ -276,6 +171,9 @@ bool CalcularCercaOptima(PtrListaArboles Optimo)
 
 	// Ordenar Arboles por segun coordenadas crecientes de x,y
 	OrdenarArboles();
+    MostrarBosque();
+
+    //Test();
 
 	/* C�culo �timo */
 	clock_gettime(CLOCK_MONOTONIC, &start);
@@ -293,13 +191,13 @@ bool CalcularCercaOptima(PtrListaArboles Optimo)
 
 
 
-void OrdenarArboles()
+void OrdenarArboles(void)
 {
   int a,b;
   
 	for(a=0; a<(ArbolesEntrada.NumArboles-1); a++)
 	{
-		for(b=1; b<ArbolesEntrada.NumArboles; b++)
+		for(b=a+1; b<ArbolesEntrada.NumArboles; b++)
 		{
 			if ( ArbolesEntrada.Arboles[b].Coord.x < ArbolesEntrada.Arboles[a].Coord.x ||
 				 (ArbolesEntrada.Arboles[b].Coord.x == ArbolesEntrada.Arboles[a].Coord.x && ArbolesEntrada.Arboles[b].Coord.y < ArbolesEntrada.Arboles[a].Coord.y) )
@@ -333,6 +231,7 @@ void OrdenarArboles()
 
 
 
+
 // Calcula la combinacin ptima entre el rango de combinaciones PrimeraCombinacion-UltimaCombinacion.
 
 bool CalcularCombinacionOptima(int PrimeraCombinacion, int UltimaCombinacion, PtrListaArboles Optimo)
@@ -350,7 +249,8 @@ bool CalcularCombinacionOptima(int PrimeraCombinacion, int UltimaCombinacion, Pt
 	CosteMejorCombinacion = Optimo->Coste;
 	for (Combinacion=PrimeraCombinacion; Combinacion<UltimaCombinacion; Combinacion++)
 	{
-    	//printf("\tC%d -> \t",Combinacion);
+        if (Combinacion==7)
+    	    printf("\tC%d -> \t",Combinacion);
 		Coste = EvaluarCombinacionListaArboles(Combinacion);
 		if ( Coste < CosteMejorCombinacion )
 		{
@@ -425,7 +325,7 @@ int EvaluarCombinacionListaArboles(int Combinacion)
 	NumArbolesTalados = ConvertirCombinacionToArbolesTalados(Combinacion, &CombinacionArbolesTalados);
 	if (DDebug) printf(" %d arboles cortados: ",NumArbolesTalados);
 	if (DDebug) MostrarArboles(CombinacionArbolesTalados);
-  MaderaArbolesTalados = CalcularMaderaArbolesTalados(CombinacionArbolesTalados);
+    MaderaArbolesTalados = CalcularMaderaArbolesTalados(CombinacionArbolesTalados);
 	if (DDebug) printf("  Madera:%4.2f  \tCerca:%4.2f ",MaderaArbolesTalados, LongitudCerca);
 	if (LongitudCerca > MaderaArbolesTalados)
 	{	// Los arboles cortados no tienen suficiente madera para construir la cerca.
@@ -506,7 +406,7 @@ void ObtenerListaCoordenadasArboles(TListaArboles CombinacionArboles, TVectorCoo
 
 	for (c=0;c<CombinacionArboles.NumArboles;c++)
 	{
-    arbol=CombinacionArboles.Arboles[c];
+        arbol=CombinacionArboles.Arboles[c];
 		Coordenadas[c].x = ArbolesEntrada.Arboles[arbol].Coord.x;
 		Coordenadas[c].y = ArbolesEntrada.Arboles[arbol].Coord.y;
 	}
@@ -551,7 +451,6 @@ CalcularMaderaArbolesTalados(TListaArboles CombinacionArboles)
 }
 
 
-
 int 
 CalcularCosteCombinacion(TListaArboles CombinacionArboles)
 {
@@ -567,8 +466,20 @@ CalcularCosteCombinacion(TListaArboles CombinacionArboles)
 }
 
 
+void
+MostrarBosque(void)
+{
+    int a;
 
+    for (a=0;a<ArbolesEntrada.NumArboles;a++)
+        PrintArbol(ArbolesEntrada.Arboles[a]);
+}
 
+void
+PrintArbol(TArbol arbol)
+{
+    printf("Arbol Id:%d --> x:%d,y:%d longitud:%d valor:%d.\n",arbol.IdArbol, arbol.Coord.x, arbol.Coord.y, arbol.Longitud, arbol.Valor);
+}
 
 
 void
