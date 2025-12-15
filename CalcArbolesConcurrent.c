@@ -63,16 +63,17 @@ typedef struct {
 // Variables Globales
 TBosque ArbolesEntrada;
 TListaArboles OptimoGlobal;
+int MejorCombinacionGlobal;  // NUEVO: para evitar recalcular
 TEstadisticas EstadisticasGlobales;
 int num_threads_total;
-int hilos_terminados = 0;
 double elapsed_sec;
 
 // Mecanismos de sincronización
 pthread_mutex_t mutex_optimo;
 pthread_mutex_t mutex_estadisticas;
-pthread_mutex_t mutex_terminado;
-pthread_cond_t cond_terminado;
+pthread_mutex_t mutex_progreso;
+pthread_cond_t cond_todos_listos;
+int hilos_inicializados = 0;
 sem_t sem_print;
 
 // Prototipos
@@ -142,8 +143,8 @@ int main(int argc, char *argv[]) {
     // Liberar recursos
     pthread_mutex_destroy(&mutex_optimo);
     pthread_mutex_destroy(&mutex_estadisticas);
-    pthread_mutex_destroy(&mutex_terminado);
-    pthread_cond_destroy(&cond_terminado);
+    pthread_mutex_destroy(&mutex_progreso);
+    pthread_cond_destroy(&cond_todos_listos);
     sem_destroy(&sem_print);
 
     exit(0);
@@ -248,41 +249,35 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
     int MaxCombinaciones;
     pthread_t threads[num_threads];
     DatosHilo datos_hilos[num_threads];
-    int combinaciones_por_hilo;
 
-    MaxCombinaciones = (int)pow(2.0, ArbolesEntrada.NumArboles) - 1;
+    // MEJORA 1: Usar desplazamiento de bits en lugar de pow()
+    MaxCombinaciones = (1 << ArbolesEntrada.NumArboles) - 1;
     OrdenarArboles();
 
     // Inicializar mecanismos de sincronización
     pthread_mutex_init(&mutex_optimo, NULL);
     pthread_mutex_init(&mutex_estadisticas, NULL);
-    pthread_mutex_init(&mutex_terminado, NULL);
-    pthread_cond_init(&cond_terminado, NULL);
+    pthread_mutex_init(&mutex_progreso, NULL);
+    pthread_cond_init(&cond_todos_listos, NULL);
     sem_init(&sem_print, 0, 1);
 
     // Inicializar óptimo global
     OptimoGlobal.NumArboles = 0;
     OptimoGlobal.Coste = DMaximoCoste;
+    MejorCombinacionGlobal = 0;  // NUEVO
     ResetEstadisticas(&EstadisticasGlobales);
-    hilos_terminados = 0;
+    hilos_inicializados = 0;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    // Dividir trabajo entre hilos
-    combinaciones_por_hilo = MaxCombinaciones / num_threads;
-
     printf("\nEvaluacion Combinaciones posibles con %d hilos:\n", num_threads);
 
-    // Crear hilos
+    // MEJORA 2: Reparto intercalado para mejor balance de carga
+    // Cada hilo procesa: id_hilo+1, id_hilo+1+num_threads, id_hilo+1+2*num_threads, ...
     for (int i = 0; i < num_threads; i++) {
         datos_hilos[i].id_hilo = i;
-        datos_hilos[i].primera_combinacion = 1 + i * combinaciones_por_hilo;
-        
-        if (i == num_threads - 1) {
-            datos_hilos[i].ultima_combinacion = MaxCombinaciones + 1;
-        } else {
-            datos_hilos[i].ultima_combinacion = 1 + (i + 1) * combinaciones_por_hilo;
-        }
+        datos_hilos[i].primera_combinacion = i + 1;
+        datos_hilos[i].ultima_combinacion = MaxCombinaciones + 1;
         
         ResetEstadisticas(&datos_hilos[i].estadisticas_locales);
         
@@ -292,25 +287,29 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
         }
     }
 
-    // Esperar a que todos los hilos terminen usando variable de condición
-    pthread_mutex_lock(&mutex_terminado);
-    while (hilos_terminados < num_threads) {
-        pthread_cond_wait(&cond_terminado, &mutex_terminado);
+    // Esperar a que todos los hilos estén listos usando variable de condición
+    pthread_mutex_lock(&mutex_progreso);
+    while (hilos_inicializados < num_threads) {
+        pthread_cond_wait(&cond_todos_listos, &mutex_progreso);
     }
-    pthread_mutex_unlock(&mutex_terminado);
+    pthread_mutex_unlock(&mutex_progreso);
+    printf("Todos los hilos iniciados correctamente. Comenzando procesamiento...\n");
 
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    elapsed_sec = (finish.tv_sec - start.tv_sec);
-    elapsed_sec += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
-
-    // Join de hilos para limpiar recursos
+    // MEJORA 3: Eliminar variable de condición redundante - solo usar pthread_join
     for (int i = 0; i < num_threads; i++) {
-        pthread_join(threads[i], NULL);
+        if (pthread_join(threads[i], NULL) != 0) {
+            perror("Error al hacer join de hilo");
+            return false;
+        }
         printf("\n");
         char titulo[100];
         sprintf(titulo, "Estadisticas Hilo %d", i);
         PrintEstadisticas(datos_hilos[i].estadisticas_locales, titulo);
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    elapsed_sec = (finish.tv_sec - start.tv_sec);
+    elapsed_sec += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
 
     // Copiar resultado final
     *Optimo = OptimoGlobal;
@@ -321,15 +320,24 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
 
 void* HiloTrabajador(void* arg) {
     DatosHilo* datos = (DatosHilo*)arg;
-    int Combinacion, MejorCombinacion = 0, CosteMejorCombinacion;
+    int Combinacion, MejorCombinacionLocal = 0, CosteMejorCombinacionLocal;
     int Coste;
-    TListaArboles OptimoParcial;
+    TListaArboles OptimoLocal, OptimoParcialPrint;
 
-    CosteMejorCombinacion = DMaximoCoste;
+    CosteMejorCombinacionLocal = DMaximoCoste;
 
+    // Señalizar que este hilo está listo usando variable de condición
+    pthread_mutex_lock(&mutex_progreso);
+    hilos_inicializados++;
+    if (hilos_inicializados == num_threads_total) {
+        pthread_cond_broadcast(&cond_todos_listos);
+    }
+    pthread_mutex_unlock(&mutex_progreso);
+
+    // MEJORA 4: Reparto intercalado - cada hilo salta num_threads_total posiciones
     for (Combinacion = datos->primera_combinacion; 
          Combinacion < datos->ultima_combinacion; 
-         Combinacion++) {
+         Combinacion += num_threads_total) {
         
         Coste = EvaluarCombinacionListaArboles(Combinacion);
         
@@ -354,45 +362,37 @@ void* HiloTrabajador(void* arg) {
             datos->estadisticas_locales.CombinacionesNoValidas++;
         }
 
-        // Actualizar mejor local
-        if (Coste < CosteMejorCombinacion) {
-            CosteMejorCombinacion = Coste;
-            MejorCombinacion = Combinacion;
-        }
-
-        // Actualizar óptimo global si encontramos algo mejor
-        pthread_mutex_lock(&mutex_optimo);
-        if (Coste < OptimoGlobal.Coste) {
-            ConvertirCombinacionToArbolesTalados(Combinacion, &OptimoGlobal);
-            OptimoGlobal.Coste = Coste;
-        }
-        pthread_mutex_unlock(&mutex_optimo);
-
-        // Cada S combinaciones, actualizar estadísticas globales y mostrar progreso
-        if ((Combinacion % S) == 0) {
-            ActualizarEstadisticasGlobales(&datos->estadisticas_locales);
+        // MEJORA 5: Actualizar mejor local primero, luego sincronizar solo si es mejor
+        if (Coste < CosteMejorCombinacionLocal) {
+            CosteMejorCombinacionLocal = Coste;
+            MejorCombinacionLocal = Combinacion;
+            ConvertirCombinacionToArbolesTalados(Combinacion, &OptimoLocal);
+            OptimoLocal.Coste = Coste;
             
+            // Solo bloquear si encontramos algo potencialmente mejor
+            pthread_mutex_lock(&mutex_optimo);
+            if (Coste < OptimoGlobal.Coste) {
+                OptimoGlobal = OptimoLocal;
+                MejorCombinacionGlobal = Combinacion;  // NUEVO: guardar combinación
+            }
+            pthread_mutex_unlock(&mutex_optimo);
+        }
+
+        // Cada S combinaciones, mostrar progreso (sin actualizar estadísticas globales)
+        if ((Combinacion % S) == 0) {
             sem_wait(&sem_print);
-            ConvertirCombinacionToArbolesTalados(MejorCombinacion, &OptimoParcial);
+            ConvertirCombinacionToArbolesTalados(MejorCombinacionLocal, &OptimoParcialPrint);
             printf("\r\t[Hilo %d][%d] OptimoParcial %d-> Coste %d, %d Arboles talados: ",
-                   datos->id_hilo, Combinacion, MejorCombinacion, 
-                   CosteMejorCombinacion, OptimoParcial.NumArboles);
-            MostrarArboles(OptimoParcial);
+                   datos->id_hilo, Combinacion, MejorCombinacionLocal, 
+                   CosteMejorCombinacionLocal, OptimoParcialPrint.NumArboles);
+            MostrarArboles(OptimoParcialPrint);
             fflush(stdout);
             sem_post(&sem_print);
         }
     }
 
-    // Actualizar estadísticas globales finales
+    // CORRECCIÓN CRÍTICA: Solo actualizar estadísticas globales UNA VEZ al final
     ActualizarEstadisticasGlobales(&datos->estadisticas_locales);
-
-    // Señalar que este hilo terminó
-    pthread_mutex_lock(&mutex_terminado);
-    hilos_terminados++;
-    if (hilos_terminados == num_threads_total) {
-        pthread_cond_signal(&cond_terminado);
-    }
-    pthread_mutex_unlock(&mutex_terminado);
 
     return NULL;
 }
@@ -416,29 +416,23 @@ void ActualizarEstadisticasGlobales(TEstadisticas *locales) {
     pthread_mutex_unlock(&mutex_estadisticas);
 }
 
+// MEJORA 6: Usar la combinación guardada en lugar de recalcular todas
 void CalcularEstadisticasFinalesOptimo(PtrListaArboles Optimo) {
     TListaArboles CombinacionArboles;
     TVectorCoordenadas CoordArboles, CercaArboles;
     int NumArboles, PuntosCerca;
     float MaderaArbolesTalados;
 
-    // Buscar la combinación que dio el óptimo
-    int MaxCombinaciones = (int)pow(2.0, ArbolesEntrada.NumArboles) - 1;
-    for (int comb = 1; comb <= MaxCombinaciones; comb++) {
-        int coste = EvaluarCombinacionListaArboles(comb);
-        if (coste == Optimo->Coste) {
-            NumArboles = ConvertirCombinacionToArboles(comb, &CombinacionArboles);
-            ObtenerListaCoordenadasArboles(CombinacionArboles, CoordArboles);
-            PuntosCerca = chainHull_2D(CoordArboles, NumArboles, CercaArboles);
-            
-            Optimo->LongitudCerca = CalcularLongitudCerca(CercaArboles, PuntosCerca);
-            MaderaArbolesTalados = CalcularMaderaArbolesTalados(*Optimo);
-            Optimo->MaderaSobrante = MaderaArbolesTalados - Optimo->LongitudCerca;
-            Optimo->CosteArbolesCortados = Optimo->Coste;
-            Optimo->CosteArbolesRestantes = CalcularCosteCombinacion(CombinacionArboles);
-            break;
-        }
-    }
+    // Usar directamente la combinación óptima guardada
+    NumArboles = ConvertirCombinacionToArboles(MejorCombinacionGlobal, &CombinacionArboles);
+    ObtenerListaCoordenadasArboles(CombinacionArboles, CoordArboles);
+    PuntosCerca = chainHull_2D(CoordArboles, NumArboles, CercaArboles);
+    
+    Optimo->LongitudCerca = CalcularLongitudCerca(CercaArboles, PuntosCerca);
+    MaderaArbolesTalados = CalcularMaderaArbolesTalados(*Optimo);
+    Optimo->MaderaSobrante = MaderaArbolesTalados - Optimo->LongitudCerca;
+    Optimo->CosteArbolesCortados = Optimo->Coste;
+    Optimo->CosteArbolesRestantes = CalcularCosteCombinacion(CombinacionArboles);
 }
 
 void OrdenarArboles() {
@@ -583,9 +577,7 @@ void ResetEstadisticas(PtrEstadisticas std) {
 
 void PrintEstadisticas(TEstadisticas estadisticas, char *tipo) {
     printf("\n++ %s ++++++++++++++++++++++++++++++++++++++++\n", tipo);
-    printf("++ Comb Evaluadas: %d \tComb Validas: %d \tComb Invalidas: %d\n",
-           estadisticas.CombinacionesEvaluadas, estadisticas.CombinacionesValidas, 
-           estadisticas.CombinacionesNoValidas);
+    printf("++ Comb Evaluadas: %d \tComb Validas: %d \tComb Invalidas: %d\n", estadisticas.CombinacionesEvaluadas, estadisticas.CombinacionesValidas, estadisticas.CombinacionesNoValidas);
     printf("++ Mejor Coste: %d \t\tPeor Coste: %d\n",
            estadisticas.MejorCombinacionCoste, estadisticas.PeorCombinacionCoste);
     printf("++ Mejor num arboles: %d \tPeor num arboles: %d\n",
