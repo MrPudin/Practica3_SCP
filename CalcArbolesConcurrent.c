@@ -13,7 +13,6 @@
 #define S 1000000
 #define DDebug 0
 
-// Estructuras de datos
 struct Arbol {
     int IdArbol;
     Point Coord;
@@ -52,7 +51,6 @@ typedef struct {
 typedef Point TVectorCoordenadas[DMaxArboles], *PtrVectorCoordenadas;
 typedef enum {false, true} bool;
 
-// Estructura para pasar datos a cada hilo
 typedef struct {
     int id_hilo;
     int primera_combinacion;
@@ -60,23 +58,27 @@ typedef struct {
     TEstadisticas estadisticas_locales;
 } DatosHilo;
 
-// Variables Globales
 TBosque ArbolesEntrada;
 TListaArboles OptimoGlobal;
-int MejorCombinacionGlobal;  // NUEVO: para evitar recalcular
+int MejorCombinacionGlobal;
 TEstadisticas EstadisticasGlobales;
 int num_threads_total;
 double elapsed_sec;
 
-// Mecanismos de sincronización
+// Mutex para proteger el acceso al óptimo global compartido
 pthread_mutex_t mutex_optimo;
+// Mutex para proteger las estadísticas globales acumuladas
 pthread_mutex_t mutex_estadisticas;
+// Mutex para coordinar el arranque de los hilos (contador + condición)
 pthread_mutex_t mutex_progreso;
+// Variable de condición: el hilo principal espera a que todos los hilos estén listos
 pthread_cond_t cond_todos_listos;
+// Contador de hilos correctamente inicializados
 int hilos_inicializados = 0;
+// Semáforo para evitar intercalación de printf entre hilos
 sem_t sem_print;
 
-// Prototipos
+
 bool LeerFicheroEntrada(char *PathFicIn);
 bool GenerarFicheroSalida(TListaArboles optimo, char *PathFicOut);
 void PrintResultado(TListaArboles Optimo);
@@ -250,21 +252,19 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
     pthread_t threads[num_threads];
     DatosHilo datos_hilos[num_threads];
 
-    // MEJORA 1: Usar desplazamiento de bits en lugar de pow()
+    // Cálculo del número total de combinaciones posibles (2^N - 1)
     MaxCombinaciones = (1 << ArbolesEntrada.NumArboles) - 1;
     OrdenarArboles();
 
-    // Inicializar mecanismos de sincronización
     pthread_mutex_init(&mutex_optimo, NULL);
     pthread_mutex_init(&mutex_estadisticas, NULL);
     pthread_mutex_init(&mutex_progreso, NULL);
     pthread_cond_init(&cond_todos_listos, NULL);
     sem_init(&sem_print, 0, 1);
 
-    // Inicializar óptimo global
     OptimoGlobal.NumArboles = 0;
     OptimoGlobal.Coste = DMaximoCoste;
-    MejorCombinacionGlobal = 0;  // NUEVO
+    MejorCombinacionGlobal = 0;
     ResetEstadisticas(&EstadisticasGlobales);
     hilos_inicializados = 0;
 
@@ -272,8 +272,11 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
 
     printf("\nEvaluacion Combinaciones posibles con %d hilos:\n", num_threads);
 
-    // MEJORA 2: Reparto intercalado para mejor balance de carga
-    // Cada hilo procesa: id_hilo+1, id_hilo+1+num_threads, id_hilo+1+2*num_threads, ...
+
+    /*
+    * Creación de hilos con reparto intercalado:
+    * Cada hilo procesa combinaciones separadas por num_threads
+    */
     for (int i = 0; i < num_threads; i++) {
         datos_hilos[i].id_hilo = i;
         datos_hilos[i].primera_combinacion = i + 1;
@@ -287,7 +290,12 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
         }
     }
 
-    // Esperar a que todos los hilos estén listos usando variable de condición
+    /*
+    * El hilo principal espera hasta que todos los hilos
+    * hayan completado su inicialización
+    * Uso mutex + variable de condición para evitar
+    * espera activa
+    */
     pthread_mutex_lock(&mutex_progreso);
     while (hilos_inicializados < num_threads) {
         pthread_cond_wait(&cond_todos_listos, &mutex_progreso);
@@ -295,7 +303,6 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
     pthread_mutex_unlock(&mutex_progreso);
     printf("Todos los hilos iniciados correctamente. Comenzando procesamiento...\n");
 
-    // MEJORA 3: Eliminar variable de condición redundante - solo usar pthread_join
     for (int i = 0; i < num_threads; i++) {
         if (pthread_join(threads[i], NULL) != 0) {
             perror("Error al hacer join de hilo");
@@ -311,7 +318,6 @@ bool CalcularCercaOptimaConcurrente(PtrListaArboles Optimo, int num_threads) {
     elapsed_sec = (finish.tv_sec - start.tv_sec);
     elapsed_sec += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
 
-    // Copiar resultado final
     *Optimo = OptimoGlobal;
     CalcularEstadisticasFinalesOptimo(Optimo);
 
@@ -326,7 +332,11 @@ void* HiloTrabajador(void* arg) {
 
     CosteMejorCombinacionLocal = DMaximoCoste;
 
-    // Señalizar que este hilo está listo usando variable de condición
+    /*
+    * Señalización de hilo listo:
+    *     - Cada hilo incrementa el contador protegido
+    *     - El último hilo despierta al hilo principal
+    */
     pthread_mutex_lock(&mutex_progreso);
     hilos_inicializados++;
     if (hilos_inicializados == num_threads_total) {
@@ -334,14 +344,15 @@ void* HiloTrabajador(void* arg) {
     }
     pthread_mutex_unlock(&mutex_progreso);
 
-    // MEJORA 4: Reparto intercalado - cada hilo salta num_threads_total posiciones
-    for (Combinacion = datos->primera_combinacion; 
-         Combinacion < datos->ultima_combinacion; 
-         Combinacion += num_threads_total) {
+    /*
+    * Bucle principal del hilo:
+    *     - Recorre combinaciones de forma intercalada,
+    *     - saltando num_threads_total posiciones en cada iteración.
+    */
+    for (Combinacion = datos->primera_combinacion; Combinacion < datos->ultima_combinacion; Combinacion += num_threads_total) {
         
         Coste = EvaluarCombinacionListaArboles(Combinacion);
         
-        // Actualizar estadísticas locales
         datos->estadisticas_locales.CombinacionesEvaluadas++;
         
         if (Coste != DMaximoCoste) {
@@ -362,23 +373,30 @@ void* HiloTrabajador(void* arg) {
             datos->estadisticas_locales.CombinacionesNoValidas++;
         }
 
-        // MEJORA 5: Actualizar mejor local primero, luego sincronizar solo si es mejor
+        /*
+        * Optimización de sincronización:
+        *   1. Se actualiza primero el óptimo local
+        *   2. Solo si mejora el local, se entra al mutex
+        *   3. Dentro del mutex se comprueba y actualiza el óptimo global
+        */
         if (Coste < CosteMejorCombinacionLocal) {
             CosteMejorCombinacionLocal = Coste;
             MejorCombinacionLocal = Combinacion;
             ConvertirCombinacionToArbolesTalados(Combinacion, &OptimoLocal);
             OptimoLocal.Coste = Coste;
             
-            // Solo bloquear si encontramos algo potencialmente mejor
             pthread_mutex_lock(&mutex_optimo);
             if (Coste < OptimoGlobal.Coste) {
                 OptimoGlobal = OptimoLocal;
-                MejorCombinacionGlobal = Combinacion;  // NUEVO: guardar combinación
+                MejorCombinacionGlobal = Combinacion;
             }
             pthread_mutex_unlock(&mutex_optimo);
         }
 
-        // Cada S combinaciones, mostrar progreso (sin actualizar estadísticas globales)
+        /*
+        * Impresión periódica de progreso:
+        *     - Se usa un semáforo para evitar que múltiples hilos escriban simultáneamente en stdout
+        */
         if ((Combinacion % S) == 0) {
             sem_wait(&sem_print);
             ConvertirCombinacionToArbolesTalados(MejorCombinacionLocal, &OptimoParcialPrint);
@@ -391,14 +409,17 @@ void* HiloTrabajador(void* arg) {
         }
     }
 
-    // CORRECCIÓN CRÍTICA: Solo actualizar estadísticas globales UNA VEZ al final
+    /*
+    * Actualización de estadísticas globales:
+    *     - Se realiza una única vez por hilo al finalizar, minimizando la contención sobre el mutex
+    */
     ActualizarEstadisticasGlobales(&datos->estadisticas_locales);
 
     return NULL;
 }
 
 void ActualizarEstadisticasGlobales(TEstadisticas *locales) {
-    pthread_mutex_lock(&mutex_estadisticas);
+        pthread_mutex_lock(&mutex_estadisticas);
     
     EstadisticasGlobales.CombinacionesEvaluadas += locales->CombinacionesEvaluadas;
     EstadisticasGlobales.CombinacionesValidas += locales->CombinacionesValidas;
@@ -416,14 +437,16 @@ void ActualizarEstadisticasGlobales(TEstadisticas *locales) {
     pthread_mutex_unlock(&mutex_estadisticas);
 }
 
-// MEJORA 6: Usar la combinación guardada en lugar de recalcular todas
+/*
+ * Cálculo final del óptimo:
+ *     - Se reutiliza directamente la combinación óptima global encontrada durante la ejecución concurrente, evitando recalcular todas las combinaciones
+ */
 void CalcularEstadisticasFinalesOptimo(PtrListaArboles Optimo) {
     TListaArboles CombinacionArboles;
     TVectorCoordenadas CoordArboles, CercaArboles;
     int NumArboles, PuntosCerca;
     float MaderaArbolesTalados;
 
-    // Usar directamente la combinación óptima guardada
     NumArboles = ConvertirCombinacionToArboles(MejorCombinacionGlobal, &CombinacionArboles);
     ObtenerListaCoordenadasArboles(CombinacionArboles, CoordArboles);
     PuntosCerca = chainHull_2D(CoordArboles, NumArboles, CercaArboles);
